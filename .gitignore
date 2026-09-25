@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Challenge data: never commit (see CHALLENGE.md)
+data/
+*.csv
+*.zip
+
+# OpenTofu / Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Private notes (not part of the submission)
+docs/open-questions.md
+CLAUDE.md
