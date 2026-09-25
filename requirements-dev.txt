@@ -1,0 +1,3 @@
+# Local development tooling only. Each service has its own requirements.txt for its image.
+-r generator_requirements.txt
+duckdb>=1.1
