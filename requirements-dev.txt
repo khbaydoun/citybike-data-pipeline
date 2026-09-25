@@ -4,3 +4,5 @@ duckdb>=1.1
 redis>=6.4
 pydantic>=2.12
 pytest>=8
+fastapi>=0.118
+httpx>=0.28

@@ -1,5 +1,5 @@
 # Citibike pipeline: local stack.
-#   docker compose up -d                   -> Redpanda, topic-init, Redis (+ ingestion, api once built)
+#   docker compose up -d --build           -> Redpanda, topic-init, Redis, ingestion, API (http://localhost:8000/docs)
 #   docker compose --profile tools up -d   -> also Redpanda Console on http://localhost:8080
 
 name: citybike
@@ -79,6 +79,24 @@ services:
       KAFKA_BROKERS: redpanda:9092
       TOPIC: ${TOPIC:-citibike-events}
       REDIS_URL: redis://redis:6379/0
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    image: citybike-api:local
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # slim image has no curl; use Python to hit the readiness endpoint
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   # Optional UI to browse topics and messages: docker compose --profile tools up -d
