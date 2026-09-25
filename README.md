@@ -46,8 +46,8 @@ mkdir -p data        # not in git: put the downloaded Citibike CSVs here
 
 **Data.** Download trip data from https://citibikenyc.com/system-data and unzip it anywhere under `data/`. File names and sub-folders don't matter: yearly archives unzip into nested folders, and the commands below find every CSV with `find`.
 - **Format:** the current Citibike columns (`ride_id, rideable_type, started_at, ended_at, start_station_name, start_station_id, …`, used since 2021). Check with `head -1 <file>.csv`. Older files (`tripduration, starttime, …`) aren't supported by the provided generator.
-- **Size:** one month (≈ 5M rides, ≈ 1 GB in Redis) is the recommended amount. Redis memory grows with the number of rides replayed within the ride-key TTL (48 h). For a fast replay of more than a month, lower it (e.g. `RIDE_TTL_S=3600 docker compose up -d`): in a fast replay both halves of a ride arrive within minutes. At real-time pace, keep the 48 h default (longest ride ≈ 25 h).
-- **Quick first run:** use a small sample kept outside `data/`, so it isn't picked up twice: `head -n 10001 <one-file>.csv > sample.csv`, then pass `--file sample.csv`.
+- **Size:** one month (≈ 5M rides, ≈ 1 GB in Redis) is the recommended amount. Redis memory grows with the number of rides replayed within the ride-key TTL (48 h): for a fast replay of more than a month, lower it (`RIDE_TTL_S=3600`).
+
 
 There are two ways to run the same pipeline, with the same images and settings: **Docker Compose** (below) or **Kubernetes via Terraform** (next subsection). Everything after startup (generator, API, acceptance check) is identical.
 
@@ -73,7 +73,7 @@ curl localhost:8000/stations/$STATION/bike-balance
 curl localhost:8000/stations/$STATION/trip-stats
 
 # 5. Verify: compare the API with values computed independently by DuckDB from the same CSVs
-#    (wait until consumer lag is 0)
+#    (waits for ingestion to catch up first)
 .venv/bin/python helpers/acceptance_check.py --file $(find data -name '*.csv' | sort)   # the same files you published
 
 # Watch it work
@@ -140,6 +140,7 @@ The `.tf` files also run unchanged with OpenTofu (`tofu init && tofu apply`). Te
 | Restart | Redis restarted mid-run: state reloaded from AOF, ingestion retried and continued. API returned `503` meanwhile, `/health` stayed `200` |
 | Scaling | 1 → 3 consumers: partitions split 2/2/2. 8 consumers: 6 active, 2 idle standbys |
 | Kubernetes (minikube) | 10k-ride sample (19,990 events) published from the Mac through `port-forward`: **72/72 checks passed**, 0 duplicates, max latency 477 ms |
+| Multiple months + nested folders | July 2024 (in its own sub-folder) + June 2026 (top level), published together via `find`: **72/72 checks** against both months combined. The months share 0 `ride_id`s, and republishing the already-loaded June sample was fully rejected as duplicates |
 
 Busiest station for the month: **`6140.05` (W 21 St & 6 Ave)**, 36,210 events, bike balance +52, average trip 646.9 s departing / 649.3 s arriving.
 
@@ -151,7 +152,7 @@ Set these as environment variables or in a `.env` file next to `docker-compose.y
 |---|---|---|---|
 | `TOPIC` | `citibike-events` | topic-init | Topic the generator publishes to |
 | `PARTITIONS` | `6` | topic-init | Partition count, which caps consumer parallelism |
-| `RIDE_TTL_S` | `172800` (48 h) | ingestion | How long a ride's first half waits for its partner in Redis. It's the pairing window, and it drives Redis memory |
+| `RIDE_TTL_S` (Terraform: `ride_ttl_s`) | `172800` (48 h) | ingestion | How long a ride's first half waits for its partner in Redis. It's the pairing window, and it drives Redis memory |
 
 The topic is created once. To change `PARTITIONS` afterwards, reset with `docker compose down -v` (this deletes all data).
 
