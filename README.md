@@ -14,7 +14,8 @@ event_generator.py → Redpanda → ingestion → Redis → HTTP API (FastAPI)
 # 1. Start the stack (Redpanda, topic, Redis)
 docker compose up -d
 
-# 2. Local tools (generator client)
+# 2. Local tools (generator client, tests). Each service installs its own requirements.txt
+#    inside its Docker image; locally you only need requirements-dev.txt.
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 # 3. Publish events. Download a month from https://citibikenyc.com/system-data into data/
@@ -35,6 +36,26 @@ Set these as environment variables or in a `.env` file next to `docker-compose.y
 
 The topic is created once. To change `PARTITIONS` afterwards, reset with `docker compose down -v` (this deletes all data).
 
+## Scaling the consumers
+
+All ingestion instances share one consumer group (`GROUP_ID`, default `citibike-ingestion`). Kafka assigns each partition to exactly one instance, so adding instances splits the partitions among them. No other configuration is needed.
+
+```bash
+# Docker Compose
+docker compose up -d --scale ingestion=3
+
+# Kubernetes (minikube)
+kubectl scale deployment ingestion --replicas=3
+
+# Check which instance owns which partition, and the lag
+docker compose exec redpanda rpk group describe citibike-ingestion
+```
+
+- **Maximum useful instances = partitions (6).** Extra instances stay idle as hot standbys.
+- **To go beyond 6,** add partitions first: `rpk topic add-partitions citibike-events --num 6`. This moves stations to new partitions, so per-station ordering is briefly lost (the logic doesn't depend on it).
+- **Each scale event triggers a rebalance.** With cooperative-sticky assignment, only the moving partitions pause. An instance that dies without leaving cleanly is detected after the session timeout (45 s), and its partitions pause until then.
+- **Autoscaling** would use consumer lag, not CPU (e.g. KEDA's Kafka scaler). At this traffic, one instance never lags.
+
 ## Architecture
 
 - **Redpanda** holds the raw event stream (topic `citibike-events`, 6 partitions, keyed by `station_id` by the provided generator).
@@ -46,7 +67,7 @@ The data profile behind these choices is in [`docs/data-profile.md`](docs/data-p
 
 ## Design decisions (why?)
 
-- **Why a plain Python consumer, not Flink / Spark / Kafka Streams?** The real peak is about 13 events/s. The hard part is correctness (duplicates, out-of-order events, start/end pairing), not scale.
+- **Why a plain Python consumer, not Kafka Streams / Flink?** Three of the four endpoints are per-event updates (newest timestamp, +1/−1 counters, a ranked score), so no framework is needed. Only trip-stats needs a join of each ride's start with its end, and a Redis hash with a 48 h TTL does that. The design still follows stream-processing concepts: the topic is the stream, each station hash is an aggregate per key (a KTable), the ride hash is a windowed join (48 h ≈ its grace period), and Redis is the state store. Kafka Streams would add a JVM, a repartition topic by `ride_id`, local state with changelogs, and a stateful deployment, and we'd still have to write the results into Redis. At about 13 events/s peak, the hard part is correctness, not scale.
 - **Why keep state in Redis and make consumers stateless?** Redis is the required serving layer anyway. Stateless consumers restart and scale freely, with no local store or changelog to restore, and both halves of a ride meet in Redis whichever consumer processes them.
 - **Why this Redis model?** One hash per station answers last-activity, bike-balance and trip-stats with a single O(1) read (we pre-aggregate on write). "Busiest" compares all stations, so it uses a sorted set whose top is one lookup. Averages are stored as sum + count, so they can be updated in any order.
 - **Why a `ride:{ride_id}` hash?** A duration needs both events of a ride. They're on different partitions (the generator keys by station) and arrive in either order, so the first one waits here for the second. It also serves as the dedup marker, and a 48 h TTL keeps memory bounded.
@@ -83,4 +104,5 @@ The challenge leaves some points open. These are the decisions we made:
 - **Replication:** RF 1 locally (single broker). Production: RF 3 with `min.insync.replicas=2`.
 - **Redis Cluster:** the multi-key Lua script assumes a single Redis node.
 - **Edge concerns:** rate limiting, auth and TLS belong in an ingress or API gateway, not in the app.
+- **Extending:** more per-station counters or hourly buckets fit the current Lua and Redis approach. Sliding windows with late-event rules, joins with other streams, or new output topics would justify Kafka Streams or Flink. That job would run as a separate consumer group that backfills from the retained topic, leaving the running pipeline untouched.
 - _TODO: metrics and alerting._
