@@ -5,7 +5,9 @@ independently by DuckDB from the same CSV file(s) that were published.
 Checks the busiest station, then every endpoint for the top stations and a
 random sample of others.
 
-Usage (after publishing the files and waiting for consumer lag 0):
+Waits (up to --wait seconds) for ingestion to catch up before comparing.
+
+Usage (after publishing the files):
     .venv/bin/python helpers/acceptance_check.py --file data/202606-citibike-tripdata_*.csv
 """
 
@@ -13,6 +15,7 @@ import argparse
 import json
 import random
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -91,6 +94,7 @@ def main() -> None:
     parser.add_argument("--api", default="http://localhost:8000")
     parser.add_argument("--top", type=int, default=5, help="top stations to check")
     parser.add_argument("--sample", type=int, default=5, help="random other stations to check")
+    parser.add_argument("--wait", type=int, default=120, help="seconds to wait for ingestion to catch up")
     args = parser.parse_args()
 
     print(f"Computing expected values with DuckDB from {len(args.file)} file(s)...")
@@ -103,7 +107,14 @@ def main() -> None:
 
     c = Checker()
     top = stations[0]
-    busiest = get(args.api, "/stations/busiest")
+    # Ingestion may still be catching up: wait until the busiest count reaches its final value.
+    deadline = time.monotonic() + args.wait
+    while True:
+        busiest = get(args.api, "/stations/busiest")
+        if busiest.get("event_count") == top["n"] or time.monotonic() > deadline:
+            break
+        print(f"  waiting for ingestion... busiest count {busiest.get('event_count')} / {top['n']}", end="\r")
+        time.sleep(2)
     c.eq("busiest.station_id", busiest.get("station_id"), top["id"])
     c.eq("busiest.event_count", busiest.get("event_count"), top["n"])
     print(f"busiest: {top['id']} with {top['n']:,} events")
