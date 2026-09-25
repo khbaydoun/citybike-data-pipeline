@@ -69,11 +69,12 @@ cd ingestion && ../.venv/bin/python -m pytest -q && cd ../api && ../.venv/bin/py
 
 ### Option B: Kubernetes (minikube + Terraform)
 
+Run it instead of Option A, not alongside: both use Docker's memory and host ports 8000/19092. If Option A is running, stop it first with `docker compose down`.
+
 ```bash
-docker compose down                     # compose and minikube share Docker's memory and ports: run one at a time
-docker compose build                    # build the two service images
 minikube start --driver=docker --cpus=4 --memory=5g
-minikube image load citybike-ingestion:local citybike-api:local
+minikube image build -t citybike-ingestion:local ./ingestion   # Kubernetes runs images but doesn't build them:
+minikube image build -t citybike-api:local ./api               # build them directly inside the cluster
 
 cd infra/terraform
 terraform init                          # once: downloads the Kubernetes provider (version locked in .terraform.lock.hcl)
@@ -84,7 +85,7 @@ kubectl -n citibike get pods            # redpanda, redis, ingestion, 2x api Run
 # Reach the cluster from the host (two terminals, keep running)
 kubectl -n citibike port-forward svc/api 8000:8000
 kubectl -n citibike port-forward svc/redpanda 19092:19092
-# Then steps 3-5 above work unchanged.
+# Then steps 2-5 of Option A work unchanged (venv, publish, query, verify).
 ```
 
 Checks that show the Kubernetes design at work (from `infra/terraform/`):
@@ -208,7 +209,7 @@ Environment variables (or a `.env` file next to `docker-compose.yml`):
 
 - **Replication:** 1 broker, RF 1 locally. Production: RF 3 with `min.insync.replicas=2`.
 - **Redis Cluster:** the multi-key Lua script assumes a single Redis node.
-- **Cluster access:** `port-forward` is a dev tunnel. Production: Ingress/LoadBalancer for the API, TLS external listeners for Kafka, images from a registry.
+- **Cluster access:** `port-forward` is a dev tunnel. Production: Ingress/LoadBalancer for the API, TLS external listeners for Kafka. Images are built inside minikube here; production would push versioned images to a registry.
 - **Edge concerns:** rate limiting, auth and TLS belong in an ingress or API gateway.
 - **Ingestion liveness:** no HTTP port. Kafka evicts a hung consumer and Kubernetes restarts a crashed one. A heartbeat-file probe would be the production addition.
 - **Observability:** logs only. Production: Prometheus metrics (lag, latency, 5xx) and alerts.

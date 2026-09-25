@@ -14,7 +14,7 @@ variable "namespace" {
 }
 
 variable "ingestion_image" {
-  description = "Loaded into minikube with `minikube image load`"
+  description = "Built inside minikube with `minikube image build`"
   type        = string
   default     = "citybike-ingestion:local"
 }
