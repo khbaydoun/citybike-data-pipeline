@@ -12,6 +12,8 @@ event_generator.py → Redpanda → ingestion → Redis → HTTP API (FastAPI)
 - **~220 ms** from generator to Redis at real-time pace. Throughput ~13.5k events/s, limited by the provided generator.
 - Runs with **Docker Compose** or on **minikube via Terraform**, with the same images and settings.
 
+**Contents:** [Architecture](#architecture) · [How to run](#how-to-run) · [Checking the API](#checking-the-api) · [Design decisions (why?)](#design-decisions-why) · [Assumptions on unclear points](#assumptions-on-unclear-points) · [Testing and results](#testing-and-results) · [Delivery guarantees and failure modes](#delivery-guarantees-and-failure-modes) · [Scaling the consumers](#scaling-the-consumers) · [Configuration](#configuration) · [Project structure](#project-structure) · [Limitations and production changes](#limitations-and-production-changes)
+
 ## Architecture
 
 | Component | Role |
@@ -147,40 +149,6 @@ Before any event is ingested, `/stations/busiest` returns `404 {"detail": "No st
 
 To check that the numbers are **correct**, not just present, run step 5 (`helpers/acceptance_check.py`). It recomputes the expected answers from the CSVs and compares them with the API.
 
-## Testing and results
-
-Three levels of tests:
-
-| Level | Where | What it covers |
-|---|---|---|
-| **Unit** (9) | `ingestion/tests/test_models.py` | Event validation: both timestamp formats (`Z` / `+00:00`), bad `event_type`, empty IDs, timestamps without a timezone, garbage JSON, lenient unknown `rideable_type` |
-| **Integration** (8) | `ingestion/tests/test_store.py` | The Lua script against a real Redis: start/end pairing, end before start, duplicates, late older events, same-timestamp ties, non-positive durations, round trips, station IDs kept as text |
-| **Integration** (8) | `api/tests/test_api.py` | Every endpoint against a real Redis, with data written by the real ingestion code (so it also tests the Redis contract between the two services): exact responses, 404, busiest ties, URL-encoded IDs, `/health` vs `/ready`, 503 when Redis is down |
-| **End to end** | `helpers/acceptance_check.py` | The whole pipeline: recomputes each station's expected answers with DuckDB from the CSVs and compares them with the live API |
-
-Running the tests (integration tests need Redis: start it with step 1 of Option A, or just `docker compose up -d redis`). They use Redis database 15, so they never touch pipeline data:
-
-```bash
-cd ingestion && ../.venv/bin/python -m pytest -v    # 17 tests: unit + Lua integration
-cd ../api    && ../.venv/bin/python -m pytest -v    # 8 tests: API integration
-```
-
-Results on a MacBook (Docker Desktop, 8 GB), one consumer:
-
-| Test | Result |
-|---|---|
-| Full month (June 2026, 6 files) | 10,735,194 events applied, 0 duplicates, 0 invalid. **212/212 checks passed** over 30 stations. Each file spans the whole month, so event time jumped back five times: the logic is order-independent |
-| Throughput | ~13.5k events/s (13.4 min), limited by the provided generator. Consumer lag stayed at a few hundred events |
-| Latency | ~220 ms at real-time pace. During fast replays it rises to seconds, from queueing inside the generator's own client |
-| Redis memory | 944 MB after the full month, mostly ride keys waiting out their 48 h TTL |
-| Duplicates | Republishing the same rides: all rejected, no count changed |
-| Redis restart | State reloaded from AOF. Ingestion retried and continued. API returned `503`, `/health` stayed `200` |
-| Scaling | 3 consumers: partitions split 2/2/2. 8 consumers: 6 active, 2 idle standbys |
-| Kubernetes | 10k-ride sample through `port-forward`: 72/72 checks, 477 ms max latency |
-| Two months | July 2024 (sub-folder) + June 2026: 72/72 checks over both combined |
-
-Busiest station in June 2026: **`6140.05` (W 21 St & 6 Ave)**, 36,210 events, balance +52, average trip 646.9 s departing / 649.3 s arriving.
-
 ## Design decisions (why?)
 
 **Streaming**
@@ -217,6 +185,40 @@ Busiest station in June 2026: **`6140.05` (W 21 St & 6 Ave)**, 36,210 events, ba
 7. **Unknown station** → `404`. No completed trips → average is `null`.
 8. **Ties for busiest:** the lexicographically highest station ID wins (Redis sorted-set order).
 9. **The generator isn't in `docker compose up`.** The challenge lists the stack as Redpanda, ingestion, Redis and API, and runs the generator from the host.
+
+## Testing and results
+
+Three levels of tests:
+
+| Level | Where | What it covers |
+|---|---|---|
+| **Unit** (9) | `ingestion/tests/test_models.py` | Event validation: both timestamp formats (`Z` / `+00:00`), bad `event_type`, empty IDs, timestamps without a timezone, garbage JSON, lenient unknown `rideable_type` |
+| **Integration** (8) | `ingestion/tests/test_store.py` | The Lua script against a real Redis: start/end pairing, end before start, duplicates, late older events, same-timestamp ties, non-positive durations, round trips, station IDs kept as text |
+| **Integration** (8) | `api/tests/test_api.py` | Every endpoint against a real Redis, with data written by the real ingestion code (so it also tests the Redis contract between the two services): exact responses, 404, busiest ties, URL-encoded IDs, `/health` vs `/ready`, 503 when Redis is down |
+| **End to end** | `helpers/acceptance_check.py` | The whole pipeline: recomputes each station's expected answers with DuckDB from the CSVs and compares them with the live API |
+
+Running the tests (integration tests need Redis: start it with step 1 of Option A, or just `docker compose up -d redis`). They use Redis database 15, so they never touch pipeline data:
+
+```bash
+cd ingestion && ../.venv/bin/python -m pytest -v    # 17 tests: unit + Lua integration
+cd ../api    && ../.venv/bin/python -m pytest -v    # 8 tests: API integration
+```
+
+Results on a MacBook (Docker Desktop, 8 GB), one consumer:
+
+| Test | Result |
+|---|---|
+| Full month (June 2026, 6 files) | 10,735,194 events applied, 0 duplicates, 0 invalid. **212/212 checks passed** over 30 stations. Each file spans the whole month, so event time jumped back five times: the logic is order-independent |
+| Throughput | ~13.5k events/s (13.4 min), limited by the provided generator. Consumer lag stayed at a few hundred events |
+| Latency | ~220 ms at real-time pace. During fast replays it rises to seconds, from queueing inside the generator's own client |
+| Redis memory | 944 MB after the full month, mostly ride keys waiting out their 48 h TTL |
+| Duplicates | Republishing the same rides: all rejected, no count changed |
+| Redis restart | State reloaded from AOF. Ingestion retried and continued. API returned `503`, `/health` stayed `200` |
+| Scaling | 3 consumers: partitions split 2/2/2. 8 consumers: 6 active, 2 idle standbys |
+| Kubernetes | 10k-ride sample through `port-forward`: 72/72 checks, 477 ms max latency |
+| Two months | July 2024 (sub-folder) + June 2026: 72/72 checks over both combined |
+
+Busiest station in June 2026: **`6140.05` (W 21 St & 6 Ave)**, 36,210 events, balance +52, average trip 646.9 s departing / 649.3 s arriving.
 
 ## Delivery guarantees and failure modes
 
