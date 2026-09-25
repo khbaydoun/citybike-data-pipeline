@@ -79,6 +79,7 @@ services:
       KAFKA_BROKERS: redpanda:9092
       TOPIC: ${TOPIC:-citibike-events}
       REDIS_URL: redis://redis:6379/0
+      RIDE_TTL_S: ${RIDE_TTL_S:-172800}
     restart: unless-stopped
 
   api:

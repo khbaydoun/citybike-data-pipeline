@@ -6,7 +6,52 @@ A real-time pipeline that tracks activity at Citibike NYC stations and answers q
 event_generator.py → Redpanda → ingestion → Redis → HTTP API (FastAPI)
 ```
 
+## Project structure
+
+```
+├── docker-compose.yml        full local stack: Redpanda, topic-init, Redis, ingestion, API
+├── event_generator.py        provided generator (unmodified)
+├── tools/run_generator.py    wrapper: fixes the generator's args.brokers typo, publishes several files
+├── ingestion/                stream processor (Redpanda → Redis)
+│   ├── ingestion/main.py         consumer loop: poll → validate → apply → commit offsets
+│   ├── ingestion/models.py       event schema and validation
+│   ├── ingestion/store.py        batched Redis writes (one round-trip per batch)
+│   ├── ingestion/apply_event.lua atomic per-event update: dedup, counters, last activity, pairing
+│   └── tests/
+├── api/                      FastAPI service (Redis → HTTP)
+│   ├── api/main.py               routes, 404/503 handling, /health, /ready
+│   ├── api/repository.py         Redis reads (the only place that knows key names)
+│   ├── api/schemas.py            response models = the public contract
+│   └── tests/
+├── infra/terraform/          Kubernetes deployment on minikube (Terraform / OpenTofu)
+├── helpers/
+│   ├── inspect_data.py           data profiling (DuckDB)
+│   └── acceptance_check.py       end-to-end check: live API vs. DuckDB over the same CSVs
+├── docs/
+│   ├── api-contract.md           endpoint responses and status codes
+│   └── data-profile.md           data findings that drove the design
+├── requirements-dev.txt      local tools (generator client, DuckDB, tests)
+└── data/                     Citibike CSVs (git-ignored, not submitted)
+```
+
 ## How to run
+
+```bash
+git clone https://github.com/khbaydoun/citybike-data-pipeline.git
+cd citybike-data-pipeline
+mkdir -p data        # not in git: put the downloaded Citibike CSVs here
+```
+
+**Prerequisites:** Docker Desktop (≥ 6 GB memory), Python 3.10+, and Citibike trip data in `data/` (see *Data* below). For Kubernetes also: minikube, Terraform ≥ 1.6 (or OpenTofu) and kubectl. On macOS: `brew install minikube kubectl hashicorp/tap/terraform`.
+
+**Data.** Download trip data from https://citibikenyc.com/system-data and unzip it anywhere under `data/`. File names and sub-folders don't matter: yearly archives unzip into nested folders, and the commands below find every CSV with `find`.
+- **Format:** the current Citibike columns (`ride_id, rideable_type, started_at, ended_at, start_station_name, start_station_id, …`, used since 2021). Check with `head -1 <file>.csv`. Older files (`tripduration, starttime, …`) aren't supported by the provided generator.
+- **Size:** one month (≈ 5M rides, ≈ 1 GB in Redis) is the recommended amount. Redis memory grows with the number of rides replayed within the ride-key TTL (48 h). For a fast replay of more than a month, lower it (e.g. `RIDE_TTL_S=3600 docker compose up -d`): in a fast replay both halves of a ride arrive within minutes. At real-time pace, keep the 48 h default (longest ride ≈ 25 h).
+- **Quick first run:** use a small sample kept outside `data/`, so it isn't picked up twice: `head -n 10001 <one-file>.csv > sample.csv`, then pass `--file sample.csv`.
+
+There are two ways to run the same pipeline, with the same images and settings: **Docker Compose** (below) or **Kubernetes via Terraform** (next subsection). Everything after startup (generator, API, acceptance check) is identical.
+
+### Run with Docker Compose
 
 ```bash
 # 1. Start the full stack (Redpanda, topic, Redis, ingestion, API)
@@ -17,18 +62,19 @@ docker compose up -d --build
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 # 3. Publish events. Download a month from https://citibikenyc.com/system-data into data/
-.venv/bin/python tools/run_generator.py --file data/202606-citibike-tripdata_*.csv --broker localhost:19092
+.venv/bin/python tools/run_generator.py --file $(find data -name '*.csv' | sort) --broker localhost:19092
 #    default pace is ~10 events/s (real time); add --burst 1000 --interval 0.01 for a fast replay
 
 # 4. Query the API (interactive docs: http://localhost:8000/docs)
 curl localhost:8000/stations/busiest
-curl localhost:8000/stations/6140.05/last-activity
-curl localhost:8000/stations/6140.05/bike-balance
-curl localhost:8000/stations/6140.05/trip-stats
+STATION=$(curl -s localhost:8000/stations/busiest | python3 -c 'import sys, json; print(json.load(sys.stdin)["station_id"])')
+curl localhost:8000/stations/$STATION/last-activity
+curl localhost:8000/stations/$STATION/bike-balance
+curl localhost:8000/stations/$STATION/trip-stats
 
 # 5. Verify: compare the API with values computed independently by DuckDB from the same CSVs
 #    (wait until consumer lag is 0)
-.venv/bin/python helpers/acceptance_check.py --file data/202606-citibike-tripdata_*.csv
+.venv/bin/python helpers/acceptance_check.py --file $(find data -name '*.csv' | sort)   # the same files you published
 
 # Watch it work
 docker compose logs -f ingestion                                   # throughput, duplicates, latency every 10 s
@@ -41,7 +87,39 @@ docker compose down -v && docker compose up -d --build
 cd ingestion && ../.venv/bin/python -m pytest -q && cd ../api && ../.venv/bin/python -m pytest -q
 ```
 
-_TODO: minikube via Terraform (files also work with OpenTofu)._
+### Run on Kubernetes (minikube + Terraform)
+
+```bash
+docker compose down                                    # free Docker Desktop memory
+docker compose build                                   # build the two service images
+minikube start --driver=docker --cpus=4 --memory=5g
+minikube image load citybike-ingestion:local citybike-api:local
+
+cd infra/terraform && terraform init && terraform apply   # prints the next steps (output "next_steps")
+kubectl -n citibike get pods                           # redpanda, redis, ingestion, 2x api Running; topic-init Completed
+
+# Reach the cluster from the Mac (two terminals, keep running)
+kubectl -n citibike port-forward svc/api 8000:8000
+kubectl -n citibike port-forward svc/redpanda 19092:19092
+
+# From here, the same commands as with compose: generator, curl, acceptance check
+```
+
+Checks that show the Kubernetes design at work (from `infra/terraform/`):
+
+```bash
+terraform plan                                      # "No changes": cluster matches the config
+terraform apply -var ingestion_replicas=3           # scale consumers; rpk group describe shows 2/2/2
+kubectl -n citibike scale deployment api --replicas=1 && terraform plan   # drift detected: 1 -> 2
+kubectl -n citibike scale statefulset redis --replicas=0                  # Redis outage:
+curl -i localhost:8000/ready                        #   503; api pods NotReady but not restarted
+terraform apply                                     #   Redis back, data intact (persistent volume)
+kubectl -n citibike delete pod redis-0              # self-healing: recreated with the same volume
+```
+
+Run compose **or** minikube, not both: they share Docker Desktop's memory and the host ports 8000/19092. To switch back: stop the port-forwards, `minikube stop`, `docker compose up -d`.
+
+The `.tf` files also run unchanged with OpenTofu (`tofu init && tofu apply`). Tear down with `terraform destroy` or `minikube delete`.
 
 ## Testing and results
 
@@ -61,6 +139,7 @@ _TODO: minikube via Terraform (files also work with OpenTofu)._
 | Redelivery | Republishing the same rides: all rejected as duplicates, no counts changed |
 | Restart | Redis restarted mid-run: state reloaded from AOF, ingestion retried and continued. API returned `503` meanwhile, `/health` stayed `200` |
 | Scaling | 1 → 3 consumers: partitions split 2/2/2. 8 consumers: 6 active, 2 idle standbys |
+| Kubernetes (minikube) | 10k-ride sample (19,990 events) published from the Mac through `port-forward`: **72/72 checks passed**, 0 duplicates, max latency 477 ms |
 
 Busiest station for the month: **`6140.05` (W 21 St & 6 Ave)**, 36,210 events, bike balance +52, average trip 646.9 s departing / 649.3 s arriving.
 
@@ -72,6 +151,7 @@ Set these as environment variables or in a `.env` file next to `docker-compose.y
 |---|---|---|---|
 | `TOPIC` | `citibike-events` | topic-init | Topic the generator publishes to |
 | `PARTITIONS` | `6` | topic-init | Partition count, which caps consumer parallelism |
+| `RIDE_TTL_S` | `172800` (48 h) | ingestion | How long a ride's first half waits for its partner in Redis. It's the pairing window, and it drives Redis memory |
 
 The topic is created once. To change `PARTITIONS` afterwards, reset with `docker compose down -v` (this deletes all data).
 
@@ -83,8 +163,8 @@ All ingestion instances share one consumer group (`GROUP_ID`, default `citibike-
 # Docker Compose
 docker compose up -d --scale ingestion=3
 
-# Kubernetes (minikube)
-kubectl scale deployment ingestion --replicas=3
+# Kubernetes (minikube), through Terraform so the state doesn't drift
+terraform -chdir=infra/terraform apply -var ingestion_replicas=3
 
 # Check which instance owns which partition, and the lag
 docker compose exec redpanda rpk group describe citibike-ingestion
@@ -114,6 +194,10 @@ The data profile behind these choices is in [`docs/data-profile.md`](docs/data-p
 - **Why 6 partitions, created explicitly?** Partitions cap consumer parallelism, so they're sized for the most consumers we'd want, not today's count. Throughput alone needs 1 (≈13 events/s peak). 6 adds scale-out headroom and splits evenly across 1, 2, 3 or 6 consumers. We don't start with 1 for its total ordering: redeliveries, replays and multi-file runs break that order anyway, so the logic is order-independent regardless. Adding partitions later remaps keys, so the count is fixed up front, and auto-creation is disabled so the broker default (1) can't sneak in.
 - **Why no compacted topic, and infinite retention?** The key is `station_id`, so compaction would keep only the last event per station. Keeping the full history lets us rebuild Redis by replaying the topic.
 - **Why Redis AOF `everysec` + `noeviction`?** Redis is our only copy of the state, not a cache. It must survive restarts (at most about 1 s lost, covered by replay) and never silently evict keys.
+- **Why Terraform for the Kubernetes deployment?** `plan` shows every change before it happens, state tracking makes `destroy` clean, and it handles ordering (the topic Job must complete before consumers start). Replicas and partitions are variables. In production the same tool would also create the cluster, managed Kafka and Redis, so everything is managed in one place.
+- **Why StatefulSets for Redpanda and Redis, and Deployments for ingestion and API?** Only Redpanda and Redis have data on disk. They need a stable identity and their own persistent volume. The consumers and the API are stateless, so any pod can replace any other and they scale by changing `replicas`.
+- **Why our own small Redpanda StatefulSet, not the official Helm chart?** The chart expects cert-manager and needs more memory than a laptop minikube has. A single-node StatefulSet with the same flags as compose is about 80 lines and fully explainable. The chart or Operator is the production path.
+- **Why 2 API replicas but 1 consumer?** An API outage is visible to users, so 2 replicas keep it up during restarts and rolling updates (readiness pulls a broken pod out of the Service). A consumer outage only delays freshness, because events wait in Kafka, so 1 is enough at this traffic.
 - **Why REST polling, not SSE or WebSocket?** The spec asks for queries, not subscriptions. Stateless request/response scales behind any load balancer.
 - **Why separate `/health` and `/ready`?** Liveness (`/health`) never touches Redis. Otherwise a Redis outage would make Kubernetes restart every API pod, which can't fix Redis. Readiness (`/ready`) checks Redis, so an affected pod just stops receiving traffic. Redis calls time out after 1 s, so an outage becomes a fast `503`, not hanging requests.
 - **Why one uvicorn worker per container?** We scale with replicas (compose `--scale`, K8s Deployment), so each container runs one process that the orchestrator can see, restart and load-balance.
@@ -146,4 +230,7 @@ The challenge leaves some points open. These are the decisions we made:
 - **Redis Cluster:** the multi-key Lua script assumes a single Redis node.
 - **Edge concerns:** rate limiting, auth and TLS belong in an ingress or API gateway, not in the app.
 - **Extending:** more per-station counters or hourly buckets fit the current Lua and Redis approach. Sliding windows with late-event rules, joins with other streams, or new output topics would justify Kafka Streams or Flink. That job would run as a separate consumer group that backfills from the retained topic, leaving the running pipeline untouched.
-- _TODO: metrics and alerting._
+- **Cluster access:** `kubectl port-forward` is a developer tunnel. Production would expose the API through an Ingress or LoadBalancer, and producers would reach Kafka through proper external listeners with TLS.
+- **Images:** loaded with `minikube image load`. Production would push versioned images to a registry.
+- **Ingestion liveness:** the consumer has no HTTP port. A hung consumer is evicted by Kafka (`max.poll.interval.ms`), a crash is restarted by Kubernetes. A heartbeat-file liveness probe would be a production addition.
+- **Observability:** logs only (throughput, duplicates, latency every 10 s). Production would export metrics (consumer lag, latency, 5xx rate) to Prometheus with alerts.
