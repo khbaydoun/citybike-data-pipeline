@@ -93,11 +93,13 @@ Checks that show the Kubernetes design at work (from `infra/terraform/`):
 ```bash
 terraform plan                                      # "No changes": cluster matches the config
 terraform apply -var ingestion_replicas=3           # scale consumers: partitions split 2/2/2
-kubectl -n citibike scale deployment api --replicas=1 && terraform plan   # drift detected: 1 -> 2
 kubectl -n citibike scale statefulset redis --replicas=0                  # Redis outage:
-curl -i localhost:8000/ready                        #   503, api pods NotReady but not restarted
+curl -i localhost:8000/ready                        #   503, /health still 200, api pods NotReady but not restarted
 terraform apply                                     #   Redis back, data intact (persistent volume)
+kubectl -n citibike scale deployment api --replicas=1 && terraform plan   # drift detected: 1 -> 2
 ```
+
+A port-forward is bound to one pod: if a check removes that pod (the last one can), restart the port-forward.
 
 Works unchanged with OpenTofu (`tofu init && tofu apply`). Tear down with `terraform destroy` or `minikube delete`.
 
@@ -183,13 +185,15 @@ docker compose exec redpanda rpk group describe citibike-ingestion    # who owns
 
 ## Configuration
 
-Environment variables (or a `.env` file next to `docker-compose.yml`):
+Settings you can change without editing code. Compose reads environment variables (or a `.env` file). Terraform takes `-var name=value`.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `TOPIC` | `citibike-events` | Topic name |
-| `PARTITIONS` | `6` | Partition count, set when the topic is first created (change it with `docker compose down -v`) |
-| `RIDE_TTL_S` (Terraform: `ride_ttl_s`) | `172800` (48 h) | How long a ride's first half waits for its partner. It drives Redis memory: for a fast replay of more than a month, lower it (`RIDE_TTL_S=3600`) |
+| Compose | Terraform | Default | Meaning |
+|---|---|---|---|
+| `TOPIC` | `topic` | `citibike-events` | Topic name |
+| `PARTITIONS` | `partitions` | `6` | Partition count, set when the topic is first created (to change it: `docker compose down -v` / `terraform destroy`) |
+| `RIDE_TTL_S` | `ride_ttl_s` | `172800` (48 h) | How long a ride's first half waits for its partner. It drives Redis memory: for a fast replay of more than a month, lower it (`3600`) |
+| `--scale ingestion=N` | `ingestion_replicas` | `1` | Consumer instances (useful maximum = partitions) |
+| — | `api_replicas` | `2` | API pods behind the Service |
 
 ## Project structure
 
