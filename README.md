@@ -75,7 +75,10 @@ docker compose build                    # build the two service images
 minikube start --driver=docker --cpus=4 --memory=5g
 minikube image load citybike-ingestion:local citybike-api:local
 
-cd infra/terraform && terraform init && terraform apply   # prints the next steps
+cd infra/terraform
+terraform init                          # once: downloads the Kubernetes provider (version locked in .terraform.lock.hcl)
+terraform plan                          # preview: 9 resources to create
+terraform apply                         # creates everything and prints the next steps
 kubectl -n citibike get pods            # redpanda, redis, ingestion, 2x api Running; topic-init Completed
 
 # Reach the cluster from the host (two terminals, keep running)
