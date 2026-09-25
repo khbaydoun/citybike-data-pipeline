@@ -230,3 +230,6 @@ data/
 # Private notes (not part of the submission)
 docs/open-questions.md
 CLAUDE.md
+
+# macOS
+.DS_Store

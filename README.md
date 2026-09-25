@@ -30,7 +30,19 @@ The topic is created once. To change `PARTITIONS` afterwards, reset with `docker
 - **Redis** is the serving layer and the only place state lives: one hash per station plus a sorted set for "busiest".
 - **API** is a stateless FastAPI service. Every endpoint is an O(1)/O(log N) Redis lookup.
 
-Detailed decision records live in [`docs/decisions/`](docs/decisions/). The data profile that drove them is in [`docs/data-profile.md`](docs/data-profile.md).
+The data profile behind these choices is in [`docs/data-profile.md`](docs/data-profile.md), and the endpoint responses are in [`docs/api-contract.md`](docs/api-contract.md).
+
+## Design decisions (why?)
+
+- **Why a plain Python consumer, not Flink / Spark / Kafka Streams?** The real peak is about 13 events/s. The hard part is correctness (duplicates, out-of-order events, start/end pairing), not scale.
+- **Why keep state in Redis and make consumers stateless?** Redis is the required serving layer anyway. Stateless consumers restart and scale freely, with no local store or changelog to restore, and both halves of a ride meet in Redis whichever consumer processes them.
+- **Why this Redis model?** One hash per station answers last-activity, bike-balance and trip-stats with a single O(1) read (we pre-aggregate on write). "Busiest" compares all stations, so it uses a sorted set whose top is one lookup. Averages are stored as sum + count, so they can be updated in any order.
+- **Why a `ride:{ride_id}` hash?** A duration needs both events of a ride. They're on different partitions (the generator keys by station) and arrive in either order, so the first one waits here for the second. It also serves as the dedup marker, and a 48 h TTL keeps memory bounded.
+- **Why a Lua script per event?** Dedup, counter updates and pairing must be all-or-nothing. A crash or two concurrent consumers must never lose or double-count an event. Lua runs atomically inside Redis in one round-trip.
+- **Why 6 partitions, created explicitly?** Partitions cap consumer parallelism, and 6 splits evenly across 1, 2, 3 or 6 consumers. Auto-creation is disabled, so the broker default (1 partition) can't sneak in.
+- **Why no compacted topic, and infinite retention?** The key is `station_id`, so compaction would keep only the last event per station. Keeping the full history lets us rebuild Redis by replaying the topic.
+- **Why Redis AOF `everysec` + `noeviction`?** Redis is our only copy of the state, not a cache. It must survive restarts (at most about 1 s lost, covered by replay) and never silently evict keys.
+- **Why REST polling, not SSE or WebSocket?** The spec asks for queries, not subscriptions. Stateless request/response scales behind any load balancer.
 
 ## Assumptions and decisions on unclear points
 
@@ -56,4 +68,7 @@ The challenge leaves some points open. These are the decisions we made:
 
 ## Limitations and what we'd change in production
 
-_TODO (replication factor 3 / `min.insync.replicas=2`, Redis Cluster implications for multi-key Lua, edge rate limiting / API gateway, metrics and alerting)._
+- **Replication:** RF 1 locally (single broker). Production: RF 3 with `min.insync.replicas=2`.
+- **Redis Cluster:** the multi-key Lua script assumes a single Redis node.
+- **Edge concerns:** rate limiting, auth and TLS belong in an ingress or API gateway, not in the app.
+- _TODO: metrics and alerting._
