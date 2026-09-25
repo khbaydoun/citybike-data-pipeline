@@ -69,7 +69,7 @@ The station with the highest total event count (`trip_start` + `trip_end`) since
 }
 ```
 
-- **Ties:** broken deterministically by Redis sorted-set ordering (lexicographically by `station_id`).
+- **Ties:** broken deterministically: the lexicographically highest `station_id` wins (Redis `ZREVRANGE` order for equal scores).
 - **No events ingested yet:** `404 {"detail": "No station activity yet"}`.
 
 ## `GET /stations/{station_id}/trip-stats`

@@ -11,8 +11,8 @@ event_generator.py → Redpanda → ingestion → Redis → HTTP API (FastAPI)
 ## How to run
 
 ```bash
-# 1. Start the stack (Redpanda, topic, Redis)
-docker compose up -d
+# 1. Start the full stack (Redpanda, topic, Redis, ingestion, API)
+docker compose up -d --build
 
 # 2. Local tools (generator client, tests). Each service installs its own requirements.txt
 #    inside its Docker image; locally you only need requirements-dev.txt.
@@ -21,9 +21,18 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 # 3. Publish events. Download a month from https://citibikenyc.com/system-data into data/
 .venv/bin/python tools/run_generator.py --file data/202606-citibike-tripdata_*.csv --broker localhost:19092
 #    default pace is ~10 events/s (real time); add --burst 1000 --interval 0.01 for a fast replay
+
+# 4. Query the API (interactive docs: http://localhost:8000/docs)
+curl localhost:8000/stations/busiest
+curl localhost:8000/stations/6140.05/last-activity
+curl localhost:8000/stations/6140.05/bike-balance
+curl localhost:8000/stations/6140.05/trip-stats
+
+# Tests (need Redis from step 1)
+cd ingestion && ../.venv/bin/python -m pytest -q && cd ../api && ../.venv/bin/python -m pytest -q
 ```
 
-_TODO: ingestion, API examples, minikube via OpenTofu._
+_TODO: minikube via Terraform (files also work with OpenTofu)._
 
 ## Configuration
 
@@ -76,6 +85,8 @@ The data profile behind these choices is in [`docs/data-profile.md`](docs/data-p
 - **Why no compacted topic, and infinite retention?** The key is `station_id`, so compaction would keep only the last event per station. Keeping the full history lets us rebuild Redis by replaying the topic.
 - **Why Redis AOF `everysec` + `noeviction`?** Redis is our only copy of the state, not a cache. It must survive restarts (at most about 1 s lost, covered by replay) and never silently evict keys.
 - **Why REST polling, not SSE or WebSocket?** The spec asks for queries, not subscriptions. Stateless request/response scales behind any load balancer.
+- **Why separate `/health` and `/ready`?** Liveness (`/health`) never touches Redis. Otherwise a Redis outage would make Kubernetes restart every API pod, which can't fix Redis. Readiness (`/ready`) checks Redis, so an affected pod just stops receiving traffic. Redis calls time out after 1 s, so an outage becomes a fast `503`, not hanging requests.
+- **Why one uvicorn worker per container?** We scale with replicas (compose `--scale`, K8s Deployment), so each container runs one process that the orchestrator can see, restart and load-balance.
 
 ## Assumptions and decisions on unclear points
 
@@ -88,7 +99,7 @@ The challenge leaves some points open. These are the decisions we made:
 5. **"Since stream start"** = since the ingestion consumer group first read the topic from the earliest offset. Restarts and redeliveries don't double-count (idempotent processing). A full reset means emptying Redis and replaying the topic.
 6. **Station IDs are opaque strings.** The data contains IDs like `SYS038`, `3184.07_OLD` and `Shop Morgan`, and 97 IDs end in `0`. They are never parsed as numbers, and the API accepts URL-encoded IDs.
 7. **Unknown station** → `404`. A known station with no completed trips → averages are `null`.
-8. **Ties for busiest** are broken deterministically (lexicographically by station ID, as Redis sorted sets order equal scores).
+8. **Ties for busiest** are broken deterministically: the lexicographically highest station ID wins (Redis `ZREVRANGE` order for equal scores).
 9. **The generator isn't part of `docker compose up`.** The challenge lists the stack as Redpanda, ingestion, Redis and API, and shows the generator run from the host against `localhost:19092`.
 
 ## Delivery guarantees and failure modes
