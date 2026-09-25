@@ -6,8 +6,6 @@ A real-time pipeline that tracks activity at Citibike NYC stations and answers q
 event_generator.py → Redpanda → ingestion → Redis → HTTP API (FastAPI)
 ```
 
-> Status: in progress. Sections marked _TODO_ are filled in as components land.
-
 ## How to run
 
 ```bash
@@ -28,11 +26,43 @@ curl localhost:8000/stations/6140.05/last-activity
 curl localhost:8000/stations/6140.05/bike-balance
 curl localhost:8000/stations/6140.05/trip-stats
 
-# Tests (need Redis from step 1)
+# 5. Verify: compare the API with values computed independently by DuckDB from the same CSVs
+#    (wait until consumer lag is 0)
+.venv/bin/python helpers/acceptance_check.py --file data/202606-citibike-tripdata_*.csv
+
+# Watch it work
+docker compose logs -f ingestion                                   # throughput, duplicates, latency every 10 s
+docker compose exec redpanda rpk group describe citibike-ingestion  # partition ownership and lag
+
+# Reset to a clean state (the topic keeps events forever; republishing without a reset would send duplicates)
+docker compose down -v && docker compose up -d --build
+
+# Unit / integration tests (need Redis from step 1)
 cd ingestion && ../.venv/bin/python -m pytest -q && cd ../api && ../.venv/bin/python -m pytest -q
 ```
 
 _TODO: minikube via Terraform (files also work with OpenTofu)._
+
+## Testing and results
+
+**Automated tests (25).** `ingestion/tests` covers validation and the Lua script's edge cases: duplicates, end before start, late older events, same-timestamp ties, non-positive durations, round trips, and station IDs kept as text. `api/tests` covers every endpoint, 404/503, and the Redis contract with ingestion, with test data written by the real ingestion code. Both run against a real Redis (db 15).
+
+**End-to-end acceptance.** `helpers/acceptance_check.py` recomputes every station's expected answers with DuckDB, straight from the CSVs, and compares them with the live API for the busiest station, the top N and a random sample.
+
+**Results: full June 2026 (6 files, one month)**, MacBook, Docker Desktop (8 GB), 1 consumer instance:
+
+| Metric | Result |
+|---|---|
+| Events | 10,735,194 published, 10,735,194 applied, 0 duplicates, 0 invalid |
+| Correctness | **212/212 checks passed** (busiest + all endpoints for 30 stations). The six files were replayed one after another, and each spans the whole month, so event time jumped back five times. The results are still exact, which confirms the logic is order-independent |
+| Throughput | ~13.5k events/s over 13.4 min, **limited by the provided generator** (pure-Python client). Consumer lag stayed at a few hundred events and ended at 0 |
+| Latency (generator → Redis) | **~220 ms** at real-time pace (bounded by the 0.2 s poll timeout). During the fast replay the measured value rose to seconds because messages queue inside the generator's own client, while consumer lag stayed at a few hundred events |
+| Redis memory | 944 MB for 5.37M keys: 2,391 station hashes, 1 sorted set, and ~5.37M ride keys, which expire 48 h after their last write |
+| Redelivery | Republishing the same rides: all rejected as duplicates, no counts changed |
+| Restart | Redis restarted mid-run: state reloaded from AOF, ingestion retried and continued. API returned `503` meanwhile, `/health` stayed `200` |
+| Scaling | 1 → 3 consumers: partitions split 2/2/2. 8 consumers: 6 active, 2 idle standbys |
+
+Busiest station for the month: **`6140.05` (W 21 St & 6 Ave)**, 36,210 events, bike balance +52, average trip 646.9 s departing / 649.3 s arriving.
 
 ## Configuration
 
