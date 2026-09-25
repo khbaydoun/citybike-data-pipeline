@@ -1,0 +1,84 @@
+# Citibike pipeline: local stack.
+#   docker compose up -d                   -> Redpanda, topic-init, Redis (+ ingestion, api once built)
+#   docker compose --profile tools up -d   -> also Redpanda Console on http://localhost:8080
+
+name: citybike
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container # single node, relaxed fsync: fine locally, not for prod
+      - --smp=1
+      - --memory=1G
+      - --default-log-level=warn
+      # Two listeners: containers use redpanda:9092, the host (generator) uses localhost:19092.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -qE 'Healthy:.+true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot job: disable topic auto-creation (partition count is a design decision,
+  # not a broker default), create the topic if it doesn't exist, then exit.
+  topic-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        rpk cluster config set auto_create_topics_enabled false -X admin.hosts=redpanda:9644 &&
+        rpk topic describe "$$TOPIC" -X brokers=redpanda:9092 >/dev/null 2>&1 \
+          && echo "topic $$TOPIC already exists" \
+          || rpk topic create "$$TOPIC" -X brokers=redpanda:9092 \
+               --partitions "$$PARTITIONS" --replicas 1 \
+               --topic-config cleanup.policy=delete \
+               --topic-config retention.ms=-1
+    environment:
+      TOPIC: ${TOPIC:-citibike-events}
+      PARTITIONS: ${PARTITIONS:-6}
+    restart: "no"
+
+  redis:
+    image: redis:8.10.2-alpine
+    command:
+      - redis-server
+      - --appendonly yes          # AOF: state survives a restart
+      - --appendfsync everysec    # at most ~1s of writes lost on crash
+      - --save ""                 # no RDB snapshots; AOF is enough
+      - --maxmemory-policy noeviction  # never silently drop state; fail writes instead
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional UI to browse topics and messages: docker compose --profile tools up -d
+  console:
+    image: docker.redpanda.com/redpandadata/console:v3.12.0
+    profiles: [tools]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+
+volumes:
+  redpanda-data:
+  redis-data:

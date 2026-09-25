@@ -12,6 +12,17 @@ event_generator.py → Redpanda → ingestion → Redis → HTTP API (FastAPI)
 
 _TODO (docker compose, generator, API examples, minikube via OpenTofu)._
 
+## Configuration
+
+Set these as environment variables or in a `.env` file next to `docker-compose.yml` (e.g. `PARTITIONS=12 docker compose up -d`).
+
+| Variable | Default | Used by | Meaning |
+|---|---|---|---|
+| `TOPIC` | `citibike-events` | topic-init | Topic the generator publishes to |
+| `PARTITIONS` | `6` | topic-init | Partition count, which caps consumer parallelism |
+
+The topic is created once. To change `PARTITIONS` afterwards, reset with `docker compose down -v` (this deletes all data).
+
 ## Architecture
 
 - **Redpanda** holds the raw event stream (topic `citibike-events`, 6 partitions, keyed by `station_id` by the provided generator).
