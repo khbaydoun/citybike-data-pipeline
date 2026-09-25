@@ -47,12 +47,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 # 3. Publish the events (see *Generator run time* below; add --burst 1000 --interval 0.01 for a fast replay)
 .venv/bin/python tools/run_generator.py --file $(find data -name '*.csv' | sort) --broker localhost:19092
 
-# 4. Query the API (interactive docs: http://localhost:8000/docs)
+# 4. Query the API (see "Checking the API" below)
 curl localhost:8000/stations/busiest
-STATION=$(curl -s localhost:8000/stations/busiest | python3 -c 'import sys, json; print(json.load(sys.stdin)["station_id"])')
-curl localhost:8000/stations/$STATION/last-activity
-curl localhost:8000/stations/$STATION/bike-balance
-curl localhost:8000/stations/$STATION/trip-stats
 
 # 5. Verify against DuckDB, computed from the same files (waits for ingestion to catch up)
 .venv/bin/python helpers/acceptance_check.py --file $(find data -name '*.csv' | sort)
@@ -112,6 +108,45 @@ kubectl -n citibike scale deployment api --replicas=1 && terraform plan   # drif
 A port-forward is bound to one pod: if a check removes that pod (the last one can), restart the port-forward.
 
 Works unchanged with OpenTofu (`tofu init && tofu apply`). Tear down with `terraform destroy` or `minikube delete`.
+
+## Checking the API
+
+The API is on **http://localhost:8000** for both options (for Kubernetes, while the `port-forward` runs). The easiest way to explore it is the interactive docs at **http://localhost:8000/docs**: pick an endpoint, click *Try it out*, enter a station ID, then *Execute*.
+
+From a terminal (`| python3 -m json.tool` pretty-prints the JSON):
+
+```bash
+# The busiest station, then all endpoints for it
+curl -s localhost:8000/stations/busiest | python3 -m json.tool
+STATION=$(curl -s localhost:8000/stations/busiest | python3 -c 'import sys, json; print(json.load(sys.stdin)["station_id"])')
+curl -s localhost:8000/stations/$STATION/last-activity | python3 -m json.tool
+curl -s localhost:8000/stations/$STATION/bike-balance  | python3 -m json.tool
+curl -s localhost:8000/stations/$STATION/trip-stats    | python3 -m json.tool
+```
+
+Example responses (June 2026, station `6140.05`):
+
+```text
+GET /stations/busiest                 {"station_id": "6140.05", "station_name": "W 21 St & 6 Ave", "event_count": 36210}
+GET /stations/6140.05/last-activity   {"station_id": "6140.05", ..., "event_type": "trip_end", "timestamp": "2026-06-30T23:48:04.114Z"}
+GET /stations/6140.05/bike-balance    {"station_id": "6140.05", ..., "bike_balance": 52, "arrivals": 18131, "departures": 18079}
+GET /stations/6140.05/trip-stats      {"station_id": "6140.05", ...,
+                                        "departing": {"trip_count": 18079, "avg_duration_seconds": 646.9},
+                                        "arriving":  {"trip_count": 18131, "avg_duration_seconds": 649.3}}
+```
+
+Error cases and health:
+
+```bash
+curl -i localhost:8000/stations/nope/bike-balance     # 404 {"detail": "Station 'nope' not found"}
+curl -i localhost:8000/stations/Shop%20Morgan/bike-balance   # IDs are text; URL-encode spaces
+curl -i localhost:8000/health                         # 200: process is up (liveness)
+curl -i localhost:8000/ready                          # 200 if Redis is reachable, else 503 (readiness)
+```
+
+Before any event is ingested, `/stations/busiest` returns `404 {"detail": "No station activity yet"}`. If Redis is down, every data endpoint returns `503`. Full response shapes: [`docs/api-contract.md`](docs/api-contract.md).
+
+To check that the numbers are **correct**, not just present, run step 5 (`helpers/acceptance_check.py`). It recomputes the expected answers from the CSVs and compares them with the API.
 
 ## Testing and results
 
