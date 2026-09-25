@@ -10,7 +10,19 @@ event_generator.py → Redpanda → ingestion → Redis → HTTP API (FastAPI)
 
 ## How to run
 
-_TODO (docker compose, generator, API examples, minikube via OpenTofu)._
+```bash
+# 1. Start the stack (Redpanda, topic, Redis)
+docker compose up -d
+
+# 2. Local tools (generator client)
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+
+# 3. Publish events. Download a month from https://citibikenyc.com/system-data into data/
+.venv/bin/python tools/run_generator.py --file data/202606-citibike-tripdata_*.csv --broker localhost:19092
+#    default pace is ~10 events/s (real time); add --burst 1000 --interval 0.01 for a fast replay
+```
+
+_TODO: ingestion, API examples, minikube via OpenTofu._
 
 ## Configuration
 
@@ -39,7 +51,7 @@ The data profile behind these choices is in [`docs/data-profile.md`](docs/data-p
 - **Why this Redis model?** One hash per station answers last-activity, bike-balance and trip-stats with a single O(1) read (we pre-aggregate on write). "Busiest" compares all stations, so it uses a sorted set whose top is one lookup. Averages are stored as sum + count, so they can be updated in any order.
 - **Why a `ride:{ride_id}` hash?** A duration needs both events of a ride. They're on different partitions (the generator keys by station) and arrive in either order, so the first one waits here for the second. It also serves as the dedup marker, and a 48 h TTL keeps memory bounded.
 - **Why a Lua script per event?** Dedup, counter updates and pairing must be all-or-nothing. A crash or two concurrent consumers must never lose or double-count an event. Lua runs atomically inside Redis in one round-trip.
-- **Why 6 partitions, created explicitly?** Partitions cap consumer parallelism, and 6 splits evenly across 1, 2, 3 or 6 consumers. Auto-creation is disabled, so the broker default (1 partition) can't sneak in.
+- **Why 6 partitions, created explicitly?** Partitions cap consumer parallelism, so they're sized for the most consumers we'd want, not today's count. Throughput alone needs 1 (≈13 events/s peak). 6 adds scale-out headroom and splits evenly across 1, 2, 3 or 6 consumers. We don't start with 1 for its total ordering: redeliveries, replays and multi-file runs break that order anyway, so the logic is order-independent regardless. Adding partitions later remaps keys, so the count is fixed up front, and auto-creation is disabled so the broker default (1) can't sneak in.
 - **Why no compacted topic, and infinite retention?** The key is `station_id`, so compaction would keep only the last event per station. Keeping the full history lets us rebuild Redis by replaying the topic.
 - **Why Redis AOF `everysec` + `noeviction`?** Redis is our only copy of the state, not a cache. It must survive restarts (at most about 1 s lost, covered by replay) and never silently evict keys.
 - **Why REST polling, not SSE or WebSocket?** The spec asks for queries, not subscriptions. Stateless request/response scales behind any load balancer.
@@ -48,7 +60,7 @@ The data profile behind these choices is in [`docs/data-profile.md`](docs/data-p
 
 The challenge leaves some points open. These are the decisions we made:
 
-1. **Generator bug.** `event_generator.py` reads `args.brokers`, but the CLI flag is `--broker`, so publishing fails with `AttributeError`. Since the file must not be modified, we run it through a thin wrapper (`tools/run_generator.py`) that supplies the missing attribute. The generator's logic is unchanged.
+1. **Generator bug.** Line 114 of `event_generator.py` logs `args.brokers`, but the CLI flag is `--broker`, so the script crashes with `AttributeError` before publishing (the producer itself uses the right attribute). Since the file must not be modified, `tools/run_generator.py` adds the missing attribute after the generator's own argument parsing and then calls its `main()` unchanged. The wrapper also accepts several files and runs them one after another, since June 2026 comes as six CSVs and loading them all at once would need about 10 GB of RAM.
 2. **"Bike balance since stream start"** = arrivals (`trip_end`) − departures (`trip_start`) at the station. The events carry no dock-inventory snapshot, so this is **net flow**, not the number of bikes physically docked, and it can be negative.
 3. **Trip stats** returns two averages: trips **departing from** the station and trips **arriving at** it. A duration is computed once both halves of a ride have been seen (the halves can arrive in either order). Round trips count in both.
 4. **Invalid durations.** Durations ≤ 0 are excluded from trip stats as a defensive check (the June 2026 data has none; its minimum is 60 s). Such rides still count toward balance and busiest. Long rides (19 over 24 h) are kept as-is.
