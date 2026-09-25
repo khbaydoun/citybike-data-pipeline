@@ -44,7 +44,7 @@ docker compose up -d --build
 # 2. Local tools (generator client, DuckDB, tests)
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
-# 3. Publish the events (default ~10 events/s; add --burst 1000 --interval 0.01 for a fast replay)
+# 3. Publish the events (see *Generator run time* below; add --burst 1000 --interval 0.01 for a fast replay)
 .venv/bin/python tools/run_generator.py --file $(find data -name '*.csv' | sort) --broker localhost:19092
 
 # 4. Query the API (interactive docs: http://localhost:8000/docs)
@@ -57,6 +57,16 @@ curl localhost:8000/stations/$STATION/trip-stats
 # 5. Verify against DuckDB, computed from the same files (waits for ingestion to catch up)
 .venv/bin/python helpers/acceptance_check.py --file $(find data -name '*.csv' | sort)
 ```
+
+**Generator run time** (measured, one CSV file ≈ 1M rides ≈ 2M events):
+
+| Input | Default pace (~10 events/s, real time) | Fast replay (`--burst 1000 --interval 0.01`, ~13.5k events/s) |
+|---|---|---|
+| 10k-row sample (20k events) | ~35 min | ~5 s |
+| One CSV file (~2M events) | ~2.5 days | ~2.5 min |
+| One month (~10M events, 5–6 files) | ~12 days | ~13–15 min |
+
+Each file also takes ~20–30 s to load and sort before publishing starts. Ctrl-C is safe: rerunning the same command re-publishes from the start, events already applied are rejected as duplicates, and the result is identical to an uninterrupted run (within the 48 h ride-key TTL).
 
 Useful extras:
 
