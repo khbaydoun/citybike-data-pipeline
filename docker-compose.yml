@@ -67,6 +67,20 @@ services:
       timeout: 3s
       retries: 10
 
+  ingestion:
+    build: ./ingestion
+    image: citybike-ingestion:local
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      TOPIC: ${TOPIC:-citibike-events}
+      REDIS_URL: redis://redis:6379/0
+    restart: unless-stopped
+
   # Optional UI to browse topics and messages: docker compose --profile tools up -d
   console:
     image: docker.redpanda.com/redpandadata/console:v3.12.0
