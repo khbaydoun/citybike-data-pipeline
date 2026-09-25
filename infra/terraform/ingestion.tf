@@ -38,6 +38,10 @@ resource "kubernetes_deployment_v1" "ingestion" {
             name  = "REDIS_URL"
             value = "redis://redis:6379/0"
           }
+          env {
+            name  = "RIDE_TTL_S"
+            value = tostring(var.ride_ttl_s)
+          }
           resources {
             requests = { cpu = "250m", memory = "128Mi" }
             limits   = { memory = "256Mi" }

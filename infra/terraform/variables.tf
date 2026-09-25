@@ -45,3 +45,9 @@ variable "api_replicas" {
   type    = number
   default = 2
 }
+
+variable "ride_ttl_s" {
+  description = "Pairing window: how long a ride's first half waits in Redis. Lower it (e.g. 3600) for fast replays of more than a month"
+  type        = number
+  default     = 172800 # 48 h, longest ride ≈ 25 h
+}
