@@ -50,7 +50,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 # 4. Query the API (see "Checking the API" below)
 curl localhost:8000/stations/busiest
 
-# 5. Verify against DuckDB, computed from the same files (waits for ingestion to catch up)
+# 5. (Optional) Verify the numbers against DuckDB, computed from the same files (waits for ingestion to catch up)
 .venv/bin/python helpers/acceptance_check.py --file $(find data -name '*.csv' | sort)
 ```
 
@@ -70,7 +70,6 @@ Useful extras:
 docker compose logs -f ingestion                                    # throughput, duplicates, latency every 10 s
 docker compose exec redpanda rpk group describe citibike-ingestion  # partition ownership and lag
 docker compose down -v && docker compose up -d --build              # reset (the topic keeps events forever)
-cd ingestion && ../.venv/bin/python -m pytest -q && cd ../api && ../.venv/bin/python -m pytest -q   # tests
 ```
 
 ### Option B: Kubernetes (minikube + Terraform)
@@ -150,8 +149,21 @@ To check that the numbers are **correct**, not just present, run step 5 (`helper
 
 ## Testing and results
 
-- **25 automated tests** against a real Redis. Ingestion: validation, duplicates, end before start, late events, ties, non-positive durations, round trips, station IDs kept as text. API: every endpoint, 404/503, and the Redis contract with ingestion.
-- **Acceptance check** (`helpers/acceptance_check.py`): recomputes each station's expected answers with DuckDB from the CSVs and compares them with the live API.
+Three levels of tests:
+
+| Level | Where | What it covers |
+|---|---|---|
+| **Unit** (9) | `ingestion/tests/test_models.py` | Event validation: both timestamp formats (`Z` / `+00:00`), bad `event_type`, empty IDs, timestamps without a timezone, garbage JSON, lenient unknown `rideable_type` |
+| **Integration** (8) | `ingestion/tests/test_store.py` | The Lua script against a real Redis: start/end pairing, end before start, duplicates, late older events, same-timestamp ties, non-positive durations, round trips, station IDs kept as text |
+| **Integration** (8) | `api/tests/test_api.py` | Every endpoint against a real Redis, with data written by the real ingestion code (so it also tests the Redis contract between the two services): exact responses, 404, busiest ties, URL-encoded IDs, `/health` vs `/ready`, 503 when Redis is down |
+| **End to end** | `helpers/acceptance_check.py` | The whole pipeline: recomputes each station's expected answers with DuckDB from the CSVs and compares them with the live API |
+
+Running the tests (integration tests need Redis: start it with step 1 of Option A, or just `docker compose up -d redis`). They use Redis database 15, so they never touch pipeline data:
+
+```bash
+cd ingestion && ../.venv/bin/python -m pytest -v    # 17 tests: unit + Lua integration
+cd ../api    && ../.venv/bin/python -m pytest -v    # 8 tests: API integration
+```
 
 Results on a MacBook (Docker Desktop, 8 GB), one consumer:
 
